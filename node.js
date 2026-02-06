@@ -35,7 +35,6 @@ app.get("/follows", async (req, res) => {
     do {
       let url = `https://friends.roproxy.com/v1/users/${userId}/followings?limit=100`;
       if (nextCursor) url += `&cursor=${nextCursor}`;
-s
       const r = await fetch(url);
       const json = await r.json();
 
