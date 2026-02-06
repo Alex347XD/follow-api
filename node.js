@@ -33,14 +33,16 @@ app.get("/follows", async (req, res) => {
     let follows = false;
 
     do {
-      let url = `https://friends.roproxy.com/v1/users/${userId}/following?limit=100`;
+      let url = `https://friends.roproxy.com/v1/users/${userId}/followings?limit=100`;
       if (nextCursor) url += `&cursor=${nextCursor}`;
-
+s
       const r = await fetch(url);
       const json = await r.json();
 
-      if (Array.isArray(json.data)) {
-        follows = json.data.some(u => String(u.id) === String(followId));
+      // Check property returned by RoProxy
+      const list = json.data || json.followings || json.users || [];
+      if (Array.isArray(list)) {
+        follows = list.some(u => String(u.id) === String(followId));
         if (follows) break;
       }
 
