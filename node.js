@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 const SECRET = process.env.API_SECRET;
 
 const CACHE = new Map();
-const CACHE_TIME = 60 * 1000;
+const CACHE_TIME = 60 * 1000; // 1 minute
 
 app.get("/follows", async (req, res) => {
   if (req.headers["x-api-key"] !== SECRET) {
@@ -29,17 +29,28 @@ app.get("/follows", async (req, res) => {
   }
 
   try {
-    const url = `https://friends.roproxy.com/v1/users/${userId}/followings`;
-    const r = await fetch(url);
-    const json = await r.json();
+    let nextCursor = null;
+    let follows = false;
 
-    const follows =
-      Array.isArray(json.data) &&
-      json.data.some(u => String(u.id) === String(followId));
+    do {
+      let url = `https://friends.roproxy.com/v1/users/${userId}/following?limit=100`;
+      if (nextCursor) url += `&cursor=${nextCursor}`;
+
+      const r = await fetch(url);
+      const json = await r.json();
+
+      if (Array.isArray(json.data)) {
+        follows = json.data.some(u => String(u.id) === String(followId));
+        if (follows) break;
+      }
+
+      nextCursor = json.nextPageCursor;
+    } while (nextCursor);
 
     CACHE.set(key, { time: now, follows });
     res.json({ ok: true, follows });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ ok: false });
   }
 });
