@@ -16,13 +16,29 @@ const HOT_TTL_MS = Number(process.env.HOT_TTL_MS || 30 * 60 * 1000); // hot keys
 const CACHE_MAX = Number(process.env.CACHE_MAX || 20000); // bound memory
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 8000);
 const UPSTREAM_MAX_PAGES = Number(process.env.UPSTREAM_MAX_PAGES || 10); // cap: 10 x 100 = 1000 followings max
-const UPSTREAM_MAX_CONCURRENT = Number(process.env.UPSTREAM_MAX_CONCURRENT || 20); // semaphore for roproxy
+const UPSTREAM_MAX_CONCURRENT = Number(process.env.UPSTREAM_MAX_CONCURRENT || 20); // semaphore for friends API
 const UPSTREAM_MAX_QUEUE = Number(process.env.UPSTREAM_MAX_QUEUE || 200); // shed load past this
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60 * 1000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 1000); // raised: Roblox servers share few egress IPs
 const BREAKER_THRESHOLD = Number(process.env.BREAKER_THRESHOLD || 10); // failures to trip
 const BREAKER_WINDOW_MS = Number(process.env.BREAKER_WINDOW_MS || 30 * 1000);
 const BREAKER_OPEN_MS = Number(process.env.BREAKER_OPEN_MS || 30 * 1000);
+// Auth for Roblox followings endpoints (required since ~May 2026; RoProxy strips
+// cookies so it 401s). Use a THROWAWAY alt's .ROBLOSECURITY, never a main account.
+// Set as a secret env var (Render: Environment > Secret). Never log it.
+const FRIENDS_BASE_URL = (process.env.FRIENDS_BASE_URL || "https://friends.roblox.com").replace(/\/+$/, "");
+function sanitizeCookie(raw) {
+  if (!raw) return "";
+  let c = String(raw).trim();
+  if ((c.startsWith('"') && c.endsWith('"')) || (c.startsWith("'") && c.endsWith("'"))) {
+    c = c.slice(1, -1).trim();
+  }
+  // Reject pasted variable assignments / whitespace (would corrupt the header)
+  if (!c || /[\s;]/.test(c) || c.includes("ROBLOSECURITY=")) return "";
+  return c;
+}
+const ROBLOX_COOKIE = sanitizeCookie(process.env.ROBLOX_COOKIE);
+const HAS_COOKIE = ROBLOX_COOKIE.length > 0;
 
 // ---------- Cluster: use all CPUs, isolate crashes ----------
 if (USE_CLUSTER && cluster.isPrimary) {
@@ -42,12 +58,62 @@ if (USE_CLUSTER && cluster.isPrimary) {
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100, maxFreeSockets: 20 });
   const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100, maxFreeSockets: 20 });
 
+  if (!HAS_COOKIE) {
+    // Visible in Render logs so a missing secret is obvious. Never logs the cookie itself.
+    console.error("ROBLOX_COOKIE not set: friends followings endpoints require auth, upstream will 401. Set it as a secret env var.");
+  } else {
+    console.log(`Upstream auth configured (cookie length ${ROBLOX_COOKIE.length}), base ${FRIENDS_BASE_URL}`);
+  }
+
   // ---------- Metrics (for /metrics) ----------
   const metrics = {
     total: 0, hit: 0, miss: 0, stale: 0, swr: 0,
     coalesced: 0, overloaded: 0, breaker_rejects: 0,
     upstream_ok: 0, upstream_fail: 0, breaker_opens: 0,
+    csrf_refreshes: 0, cookie_auth_fail: 0,
   };
+
+  // ---------- Roblox x-csrf-token handling ----------
+  // Authed endpoints need `.ROBLOSECURITY` cookie + a rotating `x-csrf-token` header.
+  // Flow: request -> 403 "Token Validation Failed" -> read x-csrf-token from that
+  // response -> retry once with it. Tokens rotate, so refresh on demand and coalesce.
+  let csrfToken = "";
+  let csrfRefresh = null; // in-flight refresh promise (singleflight)
+  async function refreshCsrfToken() {
+    if (csrfRefresh) return csrfRefresh;
+    csrfRefresh = (async () => {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+      try {
+        // auth.roblox.com/v2/logout returns 403 + x-csrf-token header for a valid cookie
+        const r = await fetch("https://auth.roblox.com/v2/logout", {
+          method: "POST",
+          agent: httpsAgent,
+          signal: ctrl.signal,
+          headers: {
+            Cookie: `.ROBLOSECURITY=${ROBLOX_COOKIE}`,
+            "User-Agent": "follow-api/1.0",
+            "Content-Length": "0",
+          },
+        });
+        const token = r.headers.get("x-csrf-token");
+        if (token) {
+          csrfToken = token;
+          metrics.csrf_refreshes++;
+          return token;
+        }
+        if (r.status === 401) {
+          metrics.cookie_auth_fail++;
+          throw Object.assign(new Error("cookie_invalid"), { status: 401 });
+        }
+        throw Object.assign(new Error(`csrf_refresh_${r.status}`), { status: r.status });
+      } finally {
+        clearTimeout(t);
+        csrfRefresh = null;
+      }
+    })();
+    return csrfRefresh;
+  }
 
   // ---------- Bounded LRU + TTL cache with hot keys + SWR ----------
   // Map preserves insertion order -> delete+set on hit = LRU. Evict oldest when over CACHE_MAX.
@@ -177,24 +243,44 @@ if (USE_CLUSTER && cluster.isPrimary) {
     return typeof v === "string" && /^\d{1,20}$/.test(v);
   }
 
-  async function fetchPage(url) {
+  async function authedFetch(url, { retryCsrf = true } = {}) {
+    if (!HAS_COOKIE) {
+      // Fail fast with a clear error instead of a confusing upstream 401
+      throw Object.assign(new Error("cookie_missing"), { status: 503 });
+    }
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
     try {
+      const headers = {
+        Accept: "application/json",
+        "User-Agent": "follow-api/1.0",
+        Cookie: `.ROBLOSECURITY=${ROBLOX_COOKIE}`,
+      };
+      if (csrfToken) headers["x-csrf-token"] = csrfToken;
       const r = await fetch(url, {
         agent: url.startsWith("https:") ? httpsAgent : httpAgent,
         signal: ctrl.signal,
-        headers: { Accept: "application/json" },
+        headers,
       });
       if (r.status === 429) {
-        const err = new Error("upstream_rate_limited");
-        err.status = 429;
-        throw err;
+        throw Object.assign(new Error("upstream_rate_limited"), { status: 429 });
+      }
+      if (r.status === 401) {
+        // Cookie expired / revoked (password change, logout). Needs rotation.
+        metrics.cookie_auth_fail++;
+        throw Object.assign(new Error("cookie_invalid"), { status: 401 });
+      }
+      if (r.status === 403 && retryCsrf) {
+        // Token missing/rotated: refresh once and retry once
+        try {
+          await refreshCsrfToken();
+        } catch (e) {
+          throw e; // cookie_invalid etc. propagates
+        }
+        return authedFetch(url, { retryCsrf: false });
       }
       if (!r.ok) {
-        const err = new Error(`upstream_${r.status}`);
-        err.status = r.status;
-        throw err;
+        throw Object.assign(new Error(`upstream_${r.status}`), { status: r.status });
       }
       return await r.json();
     } finally {
@@ -212,13 +298,14 @@ if (USE_CLUSTER && cluster.isPrimary) {
       const ids = new Set();
       let nextCursor = null;
       for (let page = 0; page < UPSTREAM_MAX_PAGES; page++) {
-        let url = `https://friends.roproxy.com/v1/users/${encodeURIComponent(userId)}/followings?limit=100`;
+        let url = `${FRIENDS_BASE_URL}/v1/users/${encodeURIComponent(userId)}/followings?limit=100&sortOrder=Desc`;
         if (nextCursor) url += `&cursor=${encodeURIComponent(nextCursor)}`;
         let json;
         try {
-          json = await fetchPage(url);
+          json = await authedFetch(url);
         } catch (e) {
-          if (e?.status === 429 || e?.status >= 500 || e?.name === "AbortError") breakerRecordFailure();
+          if (e?.status === 429 || (e?.status >= 500 && e?.status !== 501) || e?.name === "AbortError") breakerRecordFailure();
+          if (e?.status === 401) breakerRecordFailure(); // bad cookie: back off too
           throw e;
         }
         const list = json.data || json.followings || json.users || [];
@@ -257,7 +344,11 @@ if (USE_CLUSTER && cluster.isPrimary) {
     );
   }
 
-  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.get("/health", (_req, res) => res.json({
+    ok: true,
+    upstream: HAS_COOKIE ? "cookie" : "missing-cookie",
+    breaker: breaker.state,
+  }));
   app.get("/metrics", (req, res) => {
     if (!SECRET || req.headers["x-api-key"] !== SECRET) {
       return res.status(403).json({ ok: false });
@@ -267,6 +358,7 @@ if (USE_CLUSTER && cluster.isPrimary) {
       cacheSize: CACHE.size, inflight: inflight.size,
       upstreamActive, upstreamQueued: upstreamQueue.length,
       breaker: breaker.state,
+      hasCookie: HAS_COOKIE,
     });
   });
 
@@ -313,6 +405,12 @@ if (USE_CLUSTER && cluster.isPrimary) {
       if (stale) {
         res.set("X-Cache", "STALE");
         return res.json({ ok: true, follows: stale.follows, stale: true });
+      }
+      if (e?.message === "cookie_missing" || e?.message === "cookie_invalid") {
+        // Never cached: Studio treats ok:false as unknown and retries.
+        // Checked before the generic 503 branch so ops can tell auth apart from overload.
+        console.error(`Upstream auth failure: ${e.message}. Set/rotate ROBLOX_COOKIE (throwaway alt account).`);
+        return res.status(502).json({ ok: false, error: e.message });
       }
       if (e?.message === "overloaded" || e?.status === 503) {
         metrics.overloaded++;
