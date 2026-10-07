@@ -85,9 +85,12 @@ changes, and account switches that end the session kill it
 
 ## Roblox Studio usage
 
-Server-side only (`HttpService`, `HttpEnabled` on). Recommended pattern is
-the shared `FollowService` ModuleScript (10 min cache, coalescing, 3x
-retry with backoff, `nil` = unknown so callers show "try again"):
+Server-side only (`HttpService`, `HttpEnabled` on). The canonical
+`FollowService` ModuleScript lives in this repo as `FollowService.lua` —
+copy it into `ServerScriptService` (name it `FollowService`) and edit the
+`FOLLOW_API_URL` / `FOLLOW_API_KEY` at the top per game. It has a 10 min
+cache, in-flight coalescing, 3x retry with backoff, and returns `nil` =
+unknown so callers can show "try again":
 
 ```lua
 local FollowService = require(script.Parent:WaitForChild("FollowService"))
