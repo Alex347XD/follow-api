@@ -14,8 +14,8 @@ local HttpService = game:GetService("HttpService")
 local FollowService = {}
 
 -- EDIT THESE per game before deploying:
-local FOLLOW_API_URL = "https://follow-api-rxiw.onrender.com/follows"
-local FOLLOW_API_KEY = "7369354c8c9db49d99c6dda4b202413a"
+local FOLLOW_API_URL = ""
+local FOLLOW_API_KEY = ""
 
 local CACHE_TTL = 600 -- fresh cache, matches API TTL
 local STALE_TTL = 60 -- API returned stale:true -> revalidate sooner
